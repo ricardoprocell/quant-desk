@@ -1,5 +1,6 @@
 """Tab 3 - options: position, lattice + BSM valuation, trading-book sensitivity, regime-aware strategies."""
 from __future__ import annotations
+import datetime as dt
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -64,8 +65,10 @@ def render(T, th, curve):
     tick = m1.text_input(T("ticker"), "SPY", key="tick").strip().upper() or "SPY"
     px, q_def, exps, meta = _market(tick)
     S0 = float(px.iloc[-1])
+    if not exps:
+        _t = dt.date.today()
+        exps = [(_t + dt.timedelta(days=d_)).isoformat() for d_ in (30, 60, 90, 180)]
     exp = m2.selectbox(T("expiry"), exps, index=min(1, len(exps) - 1))
-    import datetime as dt
     Texp = max((dt.date.fromisoformat(exp) - dt.date.today()).days, 1) / 365.0
     S = m3.number_input(T("spot_px"), 0.01, 1e6, round(S0, 2), step=max(round(S0 * 0.001, 2), 0.01), format="%.2f", key=f"S_{tick}_{meta['source']}")
     r_def = float(curve.zero(max(Texp, 0.02), "cc")) if curve is not None else 0.04

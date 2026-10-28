@@ -264,8 +264,16 @@ def fetch_underlying(ticker):
             q = q / 100 if q > 0.2 else q
         except Exception:  # noqa: BLE001
             pass
-        exps = list(tk.options)
-        return h, q, exps, _meta("LIVE", f"yfinance: {ticker}", str(h.index[-1].date()))
+        try:
+            exps = list(tk.options)
+        except Exception:  # noqa: BLE001
+            exps = []
+        note = f"yfinance: {ticker}"
+        if not exps:                      # Yahoo sometimes serves prices but blocks the option-expiry list
+            today = dt.date.today()
+            exps = [(today + dt.timedelta(days=d)).isoformat() for d in (30, 60, 90, 180)]
+            note += " (expiries approximate: option list unavailable)"
+        return h, q, exps, _meta("LIVE", note, str(h.index[-1].date()))
     except Exception as e:  # noqa: BLE001
         today = dt.date.today()
         exps = [(today + dt.timedelta(days=d)).isoformat() for d in (30, 60, 90, 180)]
