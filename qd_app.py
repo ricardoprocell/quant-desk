@@ -26,6 +26,12 @@ def main():
             D.clear_cache()
             st.rerun()
         st.caption(T("about"))
+        with st.expander("Data status"):
+            dg = D.diagnostics()
+            st.caption(f"Snapshot: {dg['status']}")
+            if dg.get("sections"):
+                st.caption(f"Contains: curve={dg['sections']['curve']} · {', '.join(dg['sections']['commodities'])} · {', '.join(dg['sections']['tickers'])}")
+            st.caption(f"URL: {dg['snapshot_url']}")
     T = lambda k, **kw: tr(k, lang, **kw)
     th = ui.theme()
     ui.inject_css(th)

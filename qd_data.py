@@ -93,6 +93,12 @@ def _snapshot_url():
     if os.environ.get("QD_SNAPSHOT_URL"):
         return os.environ["QD_SNAPSHOT_URL"]
     try:
+        import streamlit as st
+        if st.secrets.get("QD_SNAPSHOT_URL"):
+            return str(st.secrets["QD_SNAPSHOT_URL"])
+    except Exception:  # noqa: BLE001
+        pass
+    try:
         for base in [Path(__file__).resolve().parent, *Path(__file__).resolve().parents[:3]]:
             cfg = base / ".git" / "config"
             if cfg.exists():
@@ -120,8 +126,24 @@ def _snap_cached():
         d["_age_h"] = age
         ok = age <= SNAPSHOT_MAX_AGE_H
         return d if ok else None, _meta("LIVE" if ok else "DEMO", "snapshot")
-    except Exception:  # noqa: BLE001
-        return None, _meta("DEMO", "snapshot unavailable")
+    except Exception as e:  # noqa: BLE001
+        return None, _meta("DEMO", f"snapshot unavailable: {type(e).__name__}: {str(e)[:80]}")
+
+
+def diagnostics():
+    """Plain-language state of the data layer, for the sidebar."""
+    url = _snapshot_url()
+    d = {"snapshot_url": url, "configured": "YOUR_GITHUB_USER" not in url}
+    if not d["configured"]:
+        d["status"] = "not configured (placeholder URL)"
+        return d
+    r = _snap_cached()
+    if r[0]:
+        d["status"] = f"ok · generated {r[0]['generated_utc'][:16].replace('T', ' ')} UTC · {r[0]['_age_h']:.1f} h old"
+        d["sections"] = {"curve": bool(r[0].get("curve")), "commodities": list(r[0].get("commodities", {})), "tickers": list(r[0].get("underlyings", {}))}
+    else:
+        d["status"] = "unreachable or too old: " + str(r[1].get("note"))
+    return d
 
 
 def _snap_data():
@@ -153,32 +175,85 @@ def _get_ok(url, timeout):
     return r
 
 
-@_cached(ok=600, fail=45)
-def fetch_curve(timeout=12):
-    """Latest FRED observations for Treasury par yields + SOFR. Returns dict series_id -> decimal rate."""
-    ids = ",".join(list(UST) + ["SOFR"])
-    try:
-        import requests
-        start = (dt.date.today() - dt.timedelta(days=45)).isoformat()
-        r = _retry(lambda: _get_ok(FRED_URL.format(ids=ids, start=start), timeout))
+FRED_ONE = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={id}&cosd={start}"
+TREASURY_URL = ("https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/{y}/all"
+                "?type=daily_treasury_yield_curve&field_tdr_date_value={y}&page&_format=csv")
+NYFED_SOFR = "https://markets.newyorkfed.org/api/rates/secured/sofr/last/1.json"
+_TSY_COLS = {"1 mo": "DGS1MO", "3 mo": "DGS3MO", "6 mo": "DGS6MO", "1 yr": "DGS1", "2 yr": "DGS2", "3 yr": "DGS3", "5 yr": "DGS5",
+             "7 yr": "DGS7", "10 yr": "DGS10", "20 yr": "DGS20", "30 yr": "DGS30"}
+
+
+def _curve_fred(timeout):
+    """One small request per series, in parallel (the combined 12-series request is slow and often times out)."""
+    from concurrent.futures import ThreadPoolExecutor
+    start = (dt.date.today() - dt.timedelta(days=45)).isoformat()
+
+    def one(i):
+        r = _retry(lambda: _get_ok(FRED_ONE.format(id=i, start=start), timeout), tries=2, pause=1.0)
         df = pd.read_csv(io.StringIO(r.text), na_values=["."])
-        date_col = df.columns[0]
-        df = df.dropna(how="all", subset=[c for c in df.columns if c != date_col])
-        last = {}
-        for c in df.columns[1:]:
-            s = df[c].dropna()
-            if len(s):
-                last[c] = float(s.iloc[-1]) / 100.0
-        if len(last) < 6:
-            raise ValueError("FRED returned too few series")
-        asof = str(df[date_col].iloc[-1])
-        hist = df.set_index(date_col)
-        return last, _meta("LIVE", "FRED: Treasury par yields + SOFR", asof), hist
-    except Exception as e:  # noqa: BLE001
-        sd = _snap_data()
-        if sd and sd.get("curve", {}).get("quotes"):
-            return sd["curve"]["quotes"], _meta("LIVE", _snap_note(sd, "FRED"), sd["curve"].get("asof")), None
-        return demo_curve(), _meta("DEMO", f"live fetch failed: {type(e).__name__}: {str(e)[:80]}"), None
+        sr = df.iloc[:, 1].dropna()
+        return i, float(sr.iloc[-1]) / 100.0, str(df.iloc[sr.index[-1], 0])
+
+    ids = list(UST) + ["SOFR"]
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        res = []
+        for f in [ex.submit(one, i) for i in ids]:
+            try:
+                res.append(f.result(timeout=timeout * 2 + 5))
+            except Exception:  # noqa: BLE001
+                pass
+    if len(res) < 6:
+        raise ValueError(f"FRED returned {len(res)} of {len(ids)} series")
+    return {i: v for i, v, _ in res}, max(d for _, _, d in res), "FRED: Treasury par yields + SOFR"
+
+
+def _parse_treasury_csv(text):
+    """US Treasury daily par yield curve CSV -> ({series_id: decimal}, date). Most recent row wins; values are in %."""
+    df = pd.read_csv(io.StringIO(text))
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    dcol = next(c for c in df.columns if c.startswith("date"))
+    df["_d"] = pd.to_datetime(df[dcol], errors="coerce")
+    df = df.dropna(subset=["_d"]).sort_values("_d")
+    if df.empty:
+        raise ValueError("Treasury CSV has no rows")
+    row = df.iloc[-1]
+    out = {sid: float(row[c]) / 100.0 for c, sid in _TSY_COLS.items() if c in df.columns and pd.notna(row[c])}
+    return out, row["_d"].date().isoformat()
+
+
+def _curve_treasury(timeout):
+    q, asof, last = None, None, None
+    for y in (dt.date.today().year, dt.date.today().year - 1):
+        try:
+            q, asof = _parse_treasury_csv(_retry(lambda y=y: _get_ok(TREASURY_URL.format(y=y), timeout), tries=2).text)
+            break
+        except Exception as e:  # noqa: BLE001
+            last = e
+    if not q or len(q) < 6:
+        raise ValueError(f"Treasury.gov unavailable: {last}")
+    try:
+        js = _retry(lambda: _get_ok(NYFED_SOFR, timeout), tries=2).json()
+        q["SOFR"] = float(js["refRates"][0]["percentRate"]) / 100.0
+    except Exception:  # noqa: BLE001
+        q["SOFR"] = q.get("DGS1MO", 0.04)      # proxy: 1M bill, flagged in the note
+        return q, asof, "US Treasury par yields (SOFR proxy: 1M bill)"
+    return q, asof, "US Treasury par yields + NY Fed SOFR"
+
+
+@_cached(ok=600, fail=45)
+def fetch_curve(timeout=20):
+    """Latest Treasury par yields + SOFR. Tries FRED, then Treasury.gov + NY Fed, then the server snapshot, then DEMO."""
+    errs = []
+    for fn in (_curve_fred, _curve_treasury):
+        try:
+            q, asof, note = fn(timeout)
+            return q, _meta("LIVE", note, asof), None
+        except Exception as e:  # noqa: BLE001
+            errs.append(f"{fn.__name__[7:]}: {type(e).__name__}: {str(e)[:60]}")
+    sd = _snap_data()
+    if sd and sd.get("curve", {}).get("quotes"):
+        return sd["curve"]["quotes"], _meta("LIVE", _snap_note(sd, "Treasury/FRED"), sd["curve"].get("asof")), None
+    return demo_curve(), _meta("DEMO", "live fetch failed (" + "; ".join(errs) + ")"), None
 
 
 def curve_instruments(quotes, ois_override=None):
