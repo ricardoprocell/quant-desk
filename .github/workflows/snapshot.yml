@@ -1,0 +1,38 @@
+name: Market data snapshot
+
+on:
+  schedule:
+    - cron: "*/30 12-22 * * 1-5"     # every 30 min on weekdays, 12:00-22:59 UTC (US market hours)
+    - cron: "15 23 * * 1-5"          # after the close
+  workflow_dispatch: {}              # run by hand from the Actions tab
+
+permissions:
+  contents: write
+
+concurrency:
+  group: snapshot
+  cancel-in-progress: true
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Fetch data
+        run: python snapshot.py /tmp/snapshot.json
+      - name: Publish to the data branch
+        run: |
+          git config user.name "quant-desk-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git checkout --orphan snapshot-tmp
+          git rm -rf . -q
+          cp /tmp/snapshot.json snapshot.json
+          git add snapshot.json
+          git commit -q -m "snapshot $(date -u +%FT%TZ)"
+          git push -f origin snapshot-tmp:data
