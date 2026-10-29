@@ -78,6 +78,62 @@ def _retry(fn, tries=2, pause=0.8):
     raise last
 
 
+# ------------------------------------------------------------------ server-side snapshot (Yahoo often blocks cloud IPs)
+# A scheduled GitHub Action (snapshot.py) fetches Yahoo/FRED from its own IP and publishes data/snapshot.json on the `data` branch.
+# Set SNAPSHOT_URL to its raw address. While it is the placeholder, the snapshot layer is skipped and only direct fetching is used.
+SNAPSHOT_URL = "https://raw.githubusercontent.com/YOUR_GITHUB_USER/quant-desk/data/snapshot.json"
+SNAPSHOT_MAX_AGE_H = 96          # Friday close must still serve on Monday morning
+
+
+def _snapshot_url():
+    """QD_SNAPSHOT_URL env var > owner/repo read from the deployed clone's .git/config > the constant above."""
+    import os
+    import re
+    from pathlib import Path
+    if os.environ.get("QD_SNAPSHOT_URL"):
+        return os.environ["QD_SNAPSHOT_URL"]
+    try:
+        for base in [Path(__file__).resolve().parent, *Path(__file__).resolve().parents[:3]]:
+            cfg = base / ".git" / "config"
+            if cfg.exists():
+                m = re.search(r"github\.com[/:]([^/\s]+)/([^/\s]+?)(?:\.git)?\s*$", cfg.read_text(), re.M)
+                if m:
+                    return f"https://raw.githubusercontent.com/{m.group(1)}/{m.group(2)}/data/snapshot.json"
+    except Exception:  # noqa: BLE001
+        pass
+    return SNAPSHOT_URL
+
+
+def _snap():
+    import os
+    if os.environ.get("QD_NO_SNAPSHOT") or "YOUR_GITHUB_USER" in _snapshot_url():
+        return None
+    return _snap_cached()
+
+
+@_cached(ok=300, fail=60)
+def _snap_cached():
+    try:
+        import json
+        d = _get_ok(_snapshot_url(), 10).json()
+        age = (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(d["generated_utc"])).total_seconds() / 3600
+        d["_age_h"] = age
+        ok = age <= SNAPSHOT_MAX_AGE_H
+        return d if ok else None, _meta("LIVE" if ok else "DEMO", "snapshot")
+    except Exception:  # noqa: BLE001
+        return None, _meta("DEMO", "snapshot unavailable")
+
+
+def _snap_data():
+    r = _snap()
+    return r[0] if r else None
+
+
+def _snap_note(d, what):
+    t = d["generated_utc"][:16].replace("T", " ")
+    return f"{what} · server snapshot {t} UTC (direct fetch blocked from this host)"
+
+
 def _meta(src, note="", asof=None):
     return {"source": src, "asof": asof or dt.date.today().isoformat(), "note": note}
 
@@ -119,6 +175,9 @@ def fetch_curve(timeout=12):
         hist = df.set_index(date_col)
         return last, _meta("LIVE", "FRED: Treasury par yields + SOFR", asof), hist
     except Exception as e:  # noqa: BLE001
+        sd = _snap_data()
+        if sd and sd.get("curve", {}).get("quotes"):
+            return sd["curve"]["quotes"], _meta("LIVE", _snap_note(sd, "FRED"), sd["curve"].get("asof")), None
         return demo_curve(), _meta("DEMO", f"live fetch failed: {type(e).__name__}: {str(e)[:80]}"), None
 
 
@@ -164,19 +223,31 @@ COMMODITIES = {
 _MC = "FGHJKMNQUVXZ"
 
 
+def _approx_expiry(key, y, m):
+    """Approximate last-trade date: crude (NYMEX CL) ~3 business days before the 25th of the PRECEDING month;
+    gold (COMEX GC) ~3rd last business day of the contract month."""
+    if key == "crude":
+        return dt.date(y, m, 1) - dt.timedelta(days=10)
+    nxt = dt.date(y + (m == 12), m % 12 + 1, 1)
+    return nxt - dt.timedelta(days=1 + 4)
+
+
 def contract_list(key, n=6, today=None):
     c = COMMODITIES[key]
     today = today or dt.date.today()
     out = []
-    y, m = today.year, today.month + 1
-    while len(out) < n:
-        if m > 12:
-            m, y = m - 12, y + 1
+    y, m = today.year, today.month
+    for _ in range(48):
         code = _MC[m - 1]
         if code in c["months"]:
-            exp = dt.date(y, m, 1) + dt.timedelta(days=24)       # approximate last-trade date
-            out.append({"ticker": f"{c['root']}{code}{str(y)[2:]}.{c['exch']}", "expiry": exp, "T": (exp - today).days / 365.0})
+            exp = _approx_expiry(key, y, m)
+            if (exp - today).days >= 3:                 # skip contracts that have already stopped trading
+                out.append({"ticker": f"{c['root']}{code}{str(y)[2:]}.{c['exch']}", "expiry": exp, "T": (exp - today).days / 365.0})
+                if len(out) == n:
+                    break
         m += 1
+        if m > 12:
+            m, y = 1, y + 1
     return out
 
 
@@ -200,6 +271,17 @@ def _last_close(ticker, timeout=8):
 
 @_cached(ok=300, fail=45)
 def fetch_commodity(key, n=6):
+    sd = _snap_data()
+    if sd and key in sd.get("commodities", {}):
+        c = sd["commodities"][key]
+        today = dt.date.today()
+        rows = []
+        for r in c["rows"]:
+            e = dt.date.fromisoformat(r["expiry"])
+            if (e - today).days >= 3:
+                rows.append({"ticker": r["ticker"], "expiry": e, "T": (e - today).days / 365.0, "price": float(r["price"])})
+        if c.get("spot") and len(rows) >= 2:
+            return float(c["spot"]), pd.DataFrame(rows), _meta("LIVE", _snap_note(sd, "Yahoo futures"))
     try:
         from concurrent.futures import ThreadPoolExecutor
         c = COMMODITIES[key]
@@ -247,6 +329,14 @@ def demo_chain(S, T, atm=0.20, skew=-0.10, curv=0.35):
 @_cached(ok=600, fail=45)
 def fetch_underlying(ticker):
     """Returns (price Series, dividend yield, expiries list, meta). Falls back to DEMO."""
+    sd = _snap_data()
+    if sd and ticker in sd.get("underlyings", {}):
+        u = sd["underlyings"][ticker]
+        h = pd.Series([float(p) for _, p in u["closes"]], index=pd.to_datetime([d for d, _ in u["closes"]]), name=ticker)
+        today = dt.date.today()
+        exps = [e for e in u["expiries"] if dt.date.fromisoformat(e) > today]
+        if len(h) >= 60 and exps:
+            return h, float(u.get("q", 0.0)), exps, _meta("LIVE", _snap_note(sd, f"Yahoo {ticker}"), str(h.index[-1].date()))
     try:
         import yfinance as yf
         tk = yf.Ticker(ticker)
@@ -283,6 +373,13 @@ def fetch_underlying(ticker):
 @_cached(ok=300, fail=45)
 def fetch_chain(ticker, expiry, S, T):
     """Option chain for one expiry as DataFrame[strike,cp,mid,bid,ask,iv_mkt]; DEMO fallback."""
+    sd = _snap_data()
+    ch = (sd or {}).get("underlyings", {}).get(ticker, {}).get("chains", {}).get(expiry)
+    if ch:
+        df = pd.DataFrame(ch, columns=["strike", "cp", "mid"])
+        df = df[(df.strike > 0.6 * S) & (df.strike < 1.4 * S)]
+        if len(df) >= 6:
+            return df.reset_index(drop=True), _meta("LIVE", _snap_note(sd, f"Yahoo chain {expiry}"))
     try:
         import yfinance as yf
         oc = yf.Ticker(ticker).option_chain(expiry)

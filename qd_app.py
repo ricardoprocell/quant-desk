@@ -30,7 +30,7 @@ def main():
     th = ui.theme()
     ui.inject_css(th)
     quotes, meta = _curve_quotes()
-    ui.hero(th, T("app_title"), T("app_sub"), meta["source"], T("demo_warn") if meta["source"] == "DEMO" else f"{meta['note']} · {meta['asof']}")
+    ui.hero(th, T("app_title"), T("app_sub"), meta["source"], (T("demo_warn") + " " + meta["note"]) if meta["source"] == "DEMO" else f"{meta['note']} · {meta['asof']}")
     t1, t2, t3 = st.tabs([T("tab1"), T("tab2"), T("tab3")])
     with t1:
         curve = tab_curve.render(T, th, quotes, meta)
